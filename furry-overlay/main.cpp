@@ -1,29 +1,42 @@
+#define NOMINMAX
 #include <windows.h>
 #include <gdiplus.h>
 #include <shellapi.h>
+#include <wininet.h>
 #include <fstream>
 #include <string>
 #include <vector>
 #include <cmath>
+#include <sstream>
+#include <iomanip>
+#include <thread>
+#include <atomic>
+#include <algorithm>
 #include "json.hpp"
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "wininet.lib")
 
 using namespace Gdiplus;
 using json = nlohmann::json;
 
 // Идентификаторы
 #define WM_TRAYICON (WM_USER + 1)
+#define WM_DOWNLOAD_COMPLETE (WM_USER + 2)
 #define IDM_EXIT 1001
 #define IDM_RELOAD 1002
 #define IDM_CLICKTHROUGH 1003
+#define IDM_ENABLE_E621 1004
+#define IDM_DOWNLOAD_NOW 1005
 #define IDM_OPACITY_START 3000
 #define IDM_SCALE_START 4000
+#define IDM_INTERVAL_START 5000
 #define HOTKEY_TOGGLE_CLICK 1
 #define HOTKEY_RELOAD 2
+#define TIMER_DOWNLOAD 1
 
-// ID иконки в ресурсах (должен совпадать с .rc файлом)
+// ID иконки в ресурсах
 #define IDI_APPICON 101
 
 // Глобальные переменные
@@ -31,17 +44,199 @@ ULONG_PTR gdiplusToken;
 HWND g_hwnd = nullptr;
 Image* g_image = nullptr;
 NOTIFYICONDATA nid = {};
-HICON g_hIcon = nullptr;  // Глобальная иконка
+HICON g_hIcon = nullptr;
 std::wstring g_imagePath = L"image.png";
+std::atomic<bool> g_downloading(false);
 
 struct Config {
     int x = 100, y = 100;
     float scale = 1.0f;
     int opacity = 255;
     bool click_through = true;
+
+    // E621 настройки
+    bool e621_enabled = false;
+    std::string e621_tags = "rating:safe";
+    int download_interval = 300; // секунды
 } cfg;
 
-// --- ФУНКЦИИ ЛОГИКИ ---
+// --- HTTP ФУНКЦИИ ---
+
+std::string DownloadString(const std::string& url) {
+    std::string result;
+    HINTERNET hInternet = InternetOpenA("E621Downloader/1.0", INTERNET_OPEN_TYPE_DIRECT, nullptr, nullptr, 0);
+    if (!hInternet) return result;
+
+    HINTERNET hConnect = InternetOpenUrlA(hInternet, url.c_str(), nullptr, 0,
+        INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+
+    if (hConnect) {
+        char buffer[4096];
+        DWORD bytesRead;
+        while (InternetReadFile(hConnect, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
+            result.append(buffer, bytesRead);
+        }
+        InternetCloseHandle(hConnect);
+    }
+
+    InternetCloseHandle(hInternet);
+    return result;
+}
+
+bool DownloadFile(const std::string& url, const std::wstring& filepath) {
+    HINTERNET hInternet = InternetOpenA("E621Downloader/1.0", INTERNET_OPEN_TYPE_DIRECT, nullptr, nullptr, 0);
+    if (!hInternet) return false;
+
+    HINTERNET hConnect = InternetOpenUrlA(hInternet, url.c_str(), nullptr, 0,
+        INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+
+    if (!hConnect) {
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    std::ofstream file(filepath, std::ios::binary);
+    if (!file.is_open()) {
+        InternetCloseHandle(hConnect);
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    char buffer[4096];
+    DWORD bytesRead;
+    bool success = true;
+
+    while (InternetReadFile(hConnect, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
+        file.write(buffer, bytesRead);
+        if (file.fail()) {
+            success = false;
+            break;
+        }
+    }
+
+    file.close();
+
+    if (!success) {
+        DeleteFileW(filepath.c_str());
+    }
+
+    InternetCloseHandle(hConnect);
+    InternetCloseHandle(hInternet);
+
+    return success;
+}
+
+// --- E621 ФУНКЦИИ ---
+
+std::string UrlEncode(const std::string& str) {
+    std::ostringstream escaped;
+    escaped << std::uppercase << std::hex << std::setfill('0');
+
+    for (unsigned char c : str) {
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == ':') {
+            escaped << static_cast<char>(c);
+        }
+        else if (c == ' ') {
+            escaped << '+';
+        }
+        else {
+            escaped << '%' << std::setw(2) << static_cast<int>(c);
+        }
+    }
+    return escaped.str();
+}
+
+bool DownloadRandomE621Image() {
+    try {
+        // Формируем теги с использованием order:random и filetype:png
+        std::string tags = cfg.e621_tags;
+
+        // Добавляем order:random для случайной выборки
+        if (tags.find("order:") == std::string::npos) {
+            tags += " order:random";
+        }
+
+        // Добавляем filetype:png для загрузки только PNG изображений
+        if (tags.find("filetype:") == std::string::npos && tags.find("type:") == std::string::npos) {
+            tags += " filetype:png";
+        }
+
+        // URL-кодируем теги
+        std::string encodedTags = UrlEncode(tags);
+
+        // Формируем URL (limit=1 так как order:random уже даёт случайный результат)
+        std::stringstream ss;
+        ss << "https://e621.net/posts.json?tags=" << encodedTags << "&limit=1";
+
+        std::string jsonData = DownloadString(ss.str());
+        if (jsonData.empty()) {
+            return false;
+        }
+
+        json response = json::parse(jsonData);
+
+        if (!response.contains("posts") || !response["posts"].is_array() || response["posts"].empty()) {
+            return false;
+        }
+
+        auto post = response["posts"][0];
+
+        // Проверка всех необходимых полей
+        if (!post.contains("file") || !post["file"].is_object()) {
+            return false;
+        }
+
+        auto& file = post["file"];
+
+        if (!file.contains("url") || file["url"].is_null()) {
+            return false;
+        }
+
+        if (!file.contains("ext") || file["ext"].is_null()) {
+            return false;
+        }
+
+        std::string imageUrl = file["url"].get<std::string>();
+        std::string ext = file["ext"].get<std::string>();
+
+        if (imageUrl.empty()) {
+            return false;
+        }
+
+        // Определяем расширение файла
+        std::wstring tempPath = L"e621_temp";
+
+        if (ext == "png") {
+            tempPath += L".png";
+        }
+        else if (ext == "jpg" || ext == "jpeg") {
+            tempPath += L".jpg";
+        }
+        else {
+            // Если не PNG/JPG, пропускаем
+            return false;
+        }
+
+        // Скачиваем файл
+        if (DownloadFile(imageUrl, tempPath)) {
+            g_imagePath = tempPath;
+            return true;
+        }
+    }
+    catch (const json::exception&) {
+        // Ошибка парсинга JSON
+    }
+    catch (const std::exception&) {
+        // Другие исключения
+    }
+    catch (...) {
+        // Неизвестные исключения
+    }
+
+    return false;
+}
+
+// --- ОСНОВНЫЕ ФУНКЦИИ ---
 
 void SaveConfig() {
     json j = {
@@ -49,7 +244,10 @@ void SaveConfig() {
         {"y", cfg.y},
         {"scale", cfg.scale},
         {"opacity", cfg.opacity},
-        {"click_through", cfg.click_through}
+        {"click_through", cfg.click_through},
+        {"e621_enabled", cfg.e621_enabled},
+        {"e621_tags", cfg.e621_tags},
+        {"download_interval", cfg.download_interval}
     };
     std::ofstream f("config.json");
     if (f.is_open()) {
@@ -60,27 +258,46 @@ void SaveConfig() {
 
 void LoadConfig() {
     std::ifstream f("config.json");
-    if (!f.good()) return;
+    if (!f.is_open()) return;
+
     try {
         json j;
         f >> j;
+        f.close();
+
         cfg.x = j.value("x", 100);
         cfg.y = j.value("y", 100);
         cfg.scale = j.value("scale", 1.0f);
         cfg.opacity = j.value("opacity", 255);
         cfg.click_through = j.value("click_through", true);
+        cfg.e621_enabled = j.value("e621_enabled", false);
+        cfg.e621_tags = j.value("e621_tags", "rating:safe");
+        cfg.download_interval = j.value("download_interval", 300);
+
+        // Валидация значений
+        cfg.x = std::clamp(cfg.x, -10000, 10000);
+        cfg.y = std::clamp(cfg.y, -10000, 10000);
+        cfg.scale = std::clamp(cfg.scale, 0.1f, 10.0f);
+        cfg.opacity = std::clamp(cfg.opacity, 0, 255);
+        cfg.download_interval = std::max(cfg.download_interval, 10);
+
+        // Проверка тегов
+        if (cfg.e621_tags.empty()) {
+            cfg.e621_tags = "rating:safe";
+        }
     }
-    catch (...) {}
-    f.close();
+    catch (...) {
+        f.close();
+    }
 }
 
 void ApplyClickThrough() {
     if (!g_hwnd) return;
-    LONG ex = GetWindowLong(g_hwnd, GWL_EXSTYLE);
+    LONG_PTR ex = GetWindowLongPtr(g_hwnd, GWL_EXSTYLE);
     if (cfg.click_through)
-        SetWindowLong(g_hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT);
+        SetWindowLongPtr(g_hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT);
     else
-        SetWindowLong(g_hwnd, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT);
+        SetWindowLongPtr(g_hwnd, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT);
 }
 
 void UpdateOverlay() {
@@ -157,10 +374,51 @@ bool LoadImage() {
     return true;
 }
 
+void StartDownloadTimer() {
+    if (cfg.e621_enabled && cfg.download_interval > 0) {
+        SetTimer(g_hwnd, TIMER_DOWNLOAD, cfg.download_interval * 1000, nullptr);
+    }
+    else {
+        KillTimer(g_hwnd, TIMER_DOWNLOAD);
+    }
+}
+
+void DownloadInBackground() {
+    // Проверяем, не идёт ли уже загрузка
+    if (g_downloading.exchange(true)) {
+        return;
+    }
+
+    std::thread([]() {
+        bool success = DownloadRandomE621Image();
+        g_downloading = false;
+
+        if (success && g_hwnd) {
+            PostMessage(g_hwnd, WM_DOWNLOAD_COMPLETE, success ? 1 : 0, 0);
+        }
+        }).detach();
+}
+
 // --- МЕНЮ ТРЕЯ ---
 
 void ShowTrayMenu(HWND hWnd) {
     HMENU hMenu = CreatePopupMenu();
+
+    // E621 опции
+    AppendMenuW(hMenu, MF_STRING | (cfg.e621_enabled ? MF_CHECKED : 0), IDM_ENABLE_E621, L"Enable E621 Auto-Download");
+    AppendMenuW(hMenu, MF_STRING | (!cfg.e621_enabled ? MF_GRAYED : 0), IDM_DOWNLOAD_NOW, L"Download Now");
+
+    // Подменю: Интервал загрузки
+    HMENU hInterval = CreatePopupMenu();
+    int intervals[] = { 30, 60, 300, 600, 1800, 3600 };
+    const wchar_t* intervalLabels[] = { L"30 sec", L"1 min", L"5 min", L"10 min", L"30 min", L"1 hour" };
+    for (int i = 0; i < 6; i++) {
+        UINT flags = MF_STRING | ((cfg.download_interval == intervals[i]) ? MF_CHECKED : 0);
+        AppendMenuW(hInterval, flags, IDM_INTERVAL_START + i, intervalLabels[i]);
+    }
+    AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hInterval), L"Download Interval");
+
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
     // Подменю: Scale
     HMENU hScale = CreatePopupMenu();
@@ -215,6 +473,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         break;
     }
 
+    case WM_TIMER:
+        if (wParam == TIMER_DOWNLOAD && cfg.e621_enabled) {
+            DownloadInBackground();
+        }
+        break;
+
+    case WM_DOWNLOAD_COMPLETE:
+        if (wParam == 1) {
+            if (LoadImage()) {
+                UpdateOverlay();
+            }
+        }
+        break;
+
     case WM_TRAYICON:
         if (lParam == WM_RBUTTONUP) {
             ShowTrayMenu(hWnd);
@@ -231,7 +503,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (wParam == HOTKEY_RELOAD) {
             LoadConfig();
             if (!LoadImage()) {
-                MessageBoxW(hWnd, L"Не удалось загрузить image.png", L"Ошибка", MB_ICONWARNING);
+                MessageBoxW(hWnd, L"Не удалось загрузить изображение", L"Ошибка", MB_ICONWARNING);
             }
             ApplyClickThrough();
             UpdateOverlay();
@@ -246,7 +518,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
-        if (id >= IDM_SCALE_START && id < IDM_SCALE_START + 6) {
+        if (id == IDM_ENABLE_E621) {
+            cfg.e621_enabled = !cfg.e621_enabled;
+            StartDownloadTimer();
+        }
+        else if (id == IDM_DOWNLOAD_NOW) {
+            if (cfg.e621_enabled) {
+                DownloadInBackground();
+            }
+        }
+        else if (id >= IDM_INTERVAL_START && id < IDM_INTERVAL_START + 6) {
+            int intervals[] = { 30, 60, 300, 600, 1800, 3600 };
+            cfg.download_interval = intervals[id - IDM_INTERVAL_START];
+            StartDownloadTimer();
+        }
+        else if (id >= IDM_SCALE_START && id < IDM_SCALE_START + 6) {
             float scales[] = { 0.25f, 0.5f, 0.75f, 1.0f, 1.5f, 2.0f };
             cfg.scale = scales[id - IDM_SCALE_START];
         }
@@ -261,7 +547,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (id == IDM_RELOAD) {
             LoadConfig();
             if (!LoadImage()) {
-                MessageBoxW(hWnd, L"Не удалось загрузить image.png", L"Ошибка", MB_ICONWARNING);
+                MessageBoxW(hWnd, L"Не удалось загрузить изображение", L"Ошибка", MB_ICONWARNING);
             }
             ApplyClickThrough();
         }
@@ -272,6 +558,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_DESTROY:
+        KillTimer(hWnd, TIMER_DOWNLOAD);
         UnregisterHotKey(hWnd, HOTKEY_TOGGLE_CLICK);
         UnregisterHotKey(hWnd, HOTKEY_RELOAD);
         Shell_NotifyIcon(NIM_DELETE, &nid);
@@ -285,7 +572,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
-    // Инициализация GDI+
     GdiplusStartupInput gsi;
     if (GdiplusStartup(&gdiplusToken, &gsi, nullptr) != Ok) {
         MessageBoxW(nullptr, L"Не удалось инициализировать GDI+", L"Ошибка", MB_ICONERROR);
@@ -295,21 +581,29 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     LoadConfig();
 
     if (!LoadImage()) {
-        MessageBoxW(nullptr, L"Не удалось загрузить image.png", L"Ошибка", MB_ICONERROR);
-        GdiplusShutdown(gdiplusToken);
-        return 1;
+        MessageBoxW(nullptr, L"Не удалось загрузить изображение", L"Предупреждение", MB_ICONWARNING);
     }
 
-    // Загрузка иконки
-    g_hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_APPICON));
+    // Используем LoadImage для получения private copy иконки
+    g_hIcon = static_cast<HICON>(LoadImageW(
+        hInst,
+        MAKEINTRESOURCEW(IDI_APPICON),
+        IMAGE_ICON,
+        0, 0,
+        LR_DEFAULTSIZE | LR_SHARED
+    ));
 
-    // Регистрация класса окна
+    // Если иконка из ресурсов не загрузилась, используем стандартную
+    if (!g_hIcon) {
+        g_hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    }
+
     WNDCLASSW wc = {};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.lpszClassName = L"OverlayWindowClass";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hIcon = g_hIcon;  // Иконка для процесса/диспетчера задач
+    wc.hIcon = g_hIcon;
 
     if (!RegisterClassW(&wc)) {
         MessageBoxW(nullptr, L"Не удалось зарегистрировать класс окна", L"Ошибка", MB_ICONERROR);
@@ -339,20 +633,24 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         return 1;
     }
 
-    // Настройка иконки в трее
     nid.cbSize = sizeof(nid);
     nid.hWnd = g_hwnd;
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = g_hIcon;  // Используем нашу иконку
-
-    wcscpy_s(nid.szTip, _countof(nid.szTip), L"Overlay Settings");
+    nid.hIcon = g_hIcon;
+    wcscpy_s(nid.szTip, _countof(nid.szTip), L"E621 Overlay");
     Shell_NotifyIcon(NIM_ADD, &nid);
 
-    // Регистрация горячих клавиш
-    RegisterHotKey(g_hwnd, HOTKEY_TOGGLE_CLICK, MOD_ALT, 'T');
-    RegisterHotKey(g_hwnd, HOTKEY_RELOAD, MOD_ALT, 'R');
+    // Регистрация горячих клавиш с проверкой
+    if (!RegisterHotKey(g_hwnd, HOTKEY_TOGGLE_CLICK, MOD_ALT, 'T')) {
+        OutputDebugStringW(L"Warning: Failed to register Alt+T hotkey\n");
+    }
+    if (!RegisterHotKey(g_hwnd, HOTKEY_RELOAD, MOD_ALT, 'R')) {
+        OutputDebugStringW(L"Warning: Failed to register Alt+R hotkey\n");
+    }
+
+    StartDownloadTimer();
 
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateOverlay();
@@ -368,10 +666,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         g_image = nullptr;
     }
 
-    // Освобождаем иконку если загружена из файла
-    if (g_hIcon) {
-        DestroyIcon(g_hIcon);
-    }
+    // Не вызываем DestroyIcon для shared иконки (LR_SHARED)
 
     GdiplusShutdown(gdiplusToken);
 
