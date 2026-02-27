@@ -29,9 +29,11 @@ using json = nlohmann::json;
 #define IDM_CLICKTHROUGH 1003
 #define IDM_ENABLE_E621 1004
 #define IDM_DOWNLOAD_NOW 1005
+#define IDM_ASPECT_FIT 1006
 #define IDM_OPACITY_START 3000
 #define IDM_SCALE_START 4000
 #define IDM_INTERVAL_START 5000
+#define IDM_MAXSIZE_START 6000
 #define HOTKEY_TOGGLE_CLICK 1
 #define HOTKEY_RELOAD 2
 #define TIMER_DOWNLOAD 1
@@ -44,7 +46,6 @@ NOTIFYICONDATA nid = {};
 HICON g_hIcon = nullptr;
 std::atomic<bool> g_downloading(false);
 
-// Буфер для хранения изображения в памяти
 std::vector<BYTE> g_imageBuffer;
 std::mutex g_bufferMutex;
 
@@ -56,7 +57,56 @@ struct Config {
     bool e621_enabled = false;
     std::string e621_tags = "rating:safe";
     int download_interval = 300;
+
+    // Новые настройки
+    int max_width = 0;      // 0 = без ограничения
+    int max_height = 0;     // 0 = без ограничения
+    bool aspect_fit = true; // Сохранять пропорции при ограничении
 } cfg;
+
+// --- Вычисление финального размера с учётом ограничений ---
+
+void CalculateFinalSize(int originalW, int originalH, int& outW, int& outH) {
+    // Применяем scale
+    float scaledW = originalW * cfg.scale;
+    float scaledH = originalH * cfg.scale;
+
+    outW = static_cast<int>(scaledW);
+    outH = static_cast<int>(scaledH);
+
+    // Проверяем ограничения
+    bool needClampW = (cfg.max_width > 0) && (outW > cfg.max_width);
+    bool needClampH = (cfg.max_height > 0) && (outH > cfg.max_height);
+
+    if (!needClampW && !needClampH) {
+        return; // Ограничения не нужны
+    }
+
+    if (cfg.aspect_fit) {
+        // Aspect Fit: сохраняем пропорции, вписываем в ограничения
+        float ratioW = (cfg.max_width > 0) ?
+            static_cast<float>(cfg.max_width) / scaledW : 1.0f;
+        float ratioH = (cfg.max_height > 0) ?
+            static_cast<float>(cfg.max_height) / scaledH : 1.0f;
+
+        // Берём минимальный коэффициент, чтобы вписаться в оба ограничения
+        float ratio = std::min(ratioW, ratioH);
+
+        if (ratio < 1.0f) {
+            outW = static_cast<int>(scaledW * ratio);
+            outH = static_cast<int>(scaledH * ratio);
+        }
+    }
+    else {
+        // Без сохранения пропорций: просто клампим каждую сторону
+        if (needClampW) outW = cfg.max_width;
+        if (needClampH) outH = cfg.max_height;
+    }
+
+    // Гарантируем минимальный размер
+    outW = std::max(outW, 1);
+    outH = std::max(outH, 1);
+}
 
 // --- HTTP: Скачивание в память ---
 
@@ -142,7 +192,6 @@ std::string UrlEncode(const std::string& str) {
     return escaped.str();
 }
 
-// Скачивает изображение с E621 напрямую в память
 bool DownloadRandomE621ImageToMemory(std::vector<BYTE>& outBuffer) {
     try {
         std::string tags = cfg.e621_tags;
@@ -180,7 +229,6 @@ bool DownloadRandomE621ImageToMemory(std::vector<BYTE>& outBuffer) {
         if (imageUrl.empty()) return false;
         if (ext != "png" && ext != "jpg" && ext != "jpeg") return false;
 
-        // Скачиваем изображение напрямую в память
         outBuffer = DownloadToMemory(imageUrl);
         return !outBuffer.empty();
 
@@ -199,7 +247,10 @@ void SaveConfig() {
         {"click_through", cfg.click_through},
         {"e621_enabled", cfg.e621_enabled},
         {"e621_tags", cfg.e621_tags},
-        {"download_interval", cfg.download_interval}
+        {"download_interval", cfg.download_interval},
+        {"max_width", cfg.max_width},
+        {"max_height", cfg.max_height},
+        {"aspect_fit", cfg.aspect_fit}
     };
     std::ofstream f("config.json");
     if (f.is_open()) { f << j.dump(4); f.close(); }
@@ -219,12 +270,17 @@ void LoadConfig() {
         cfg.e621_enabled = j.value("e621_enabled", false);
         cfg.e621_tags = j.value("e621_tags", "rating:safe");
         cfg.download_interval = j.value("download_interval", 300);
+        cfg.max_width = j.value("max_width", 0);
+        cfg.max_height = j.value("max_height", 0);
+        cfg.aspect_fit = j.value("aspect_fit", true);
 
         cfg.x = std::clamp(cfg.x, -10000, 10000);
         cfg.y = std::clamp(cfg.y, -10000, 10000);
         cfg.scale = std::clamp(cfg.scale, 0.1f, 10.0f);
         cfg.opacity = std::clamp(cfg.opacity, 0, 255);
         cfg.download_interval = std::max(cfg.download_interval, 10);
+        cfg.max_width = std::max(cfg.max_width, 0);
+        cfg.max_height = std::max(cfg.max_height, 0);
         if (cfg.e621_tags.empty()) cfg.e621_tags = "rating:safe";
     }
     catch (...) { f.close(); }
@@ -242,8 +298,12 @@ void ApplyClickThrough() {
 void UpdateOverlay() {
     if (!g_hwnd || !g_image || g_image->GetLastStatus() != Ok) return;
 
-    int w = static_cast<int>(g_image->GetWidth() * cfg.scale);
-    int h = static_cast<int>(g_image->GetHeight() * cfg.scale);
+    int originalW = g_image->GetWidth();
+    int originalH = g_image->GetHeight();
+
+    int w, h;
+    CalculateFinalSize(originalW, originalH, w, h);
+
     if (w <= 0 || h <= 0) return;
 
     HDC screenDC = GetDC(nullptr);
@@ -291,7 +351,6 @@ void UpdateOverlay() {
     ReleaseDC(nullptr, screenDC);
 }
 
-// Загрузка изображения из внутреннего буфера
 bool LoadImageFromBuffer() {
     std::lock_guard<std::mutex> lock(g_bufferMutex);
 
@@ -306,7 +365,6 @@ bool LoadImageFromBuffer() {
     return true;
 }
 
-// Загрузка изображения из файла (для начального запуска)
 bool LoadImageFromFile(const std::wstring& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) return false;
@@ -329,7 +387,6 @@ bool LoadImageFromFile(const std::wstring& path) {
     if (g_image) delete g_image;
     g_image = newImage;
 
-    // Сохраняем в глобальный буфер
     std::lock_guard<std::mutex> lock(g_bufferMutex);
     g_imageBuffer = std::move(buffer);
 
@@ -389,6 +446,29 @@ void ShowTrayMenu(HWND hWnd) {
         AppendMenuW(hScale, flags, IDM_SCALE_START + i, lbl.c_str());
     }
     AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hScale), L"Scale");
+
+    // Подменю максимального размера
+    HMENU hMaxSize = CreatePopupMenu();
+    struct MaxSizeOption { int w; int h; const wchar_t* label; };
+    MaxSizeOption maxSizes[] = {
+        {0, 0, L"No Limit"},
+        {640, 480, L"640x480"},
+        {800, 600, L"800x600"},
+        {1024, 768, L"1024x768"},
+        {1280, 720, L"1280x720 (HD)"},
+        {1920, 1080, L"1920x1080 (FHD)"},
+        {500, 500, L"500x500"},
+        {300, 300, L"300x300"}
+    };
+    for (int i = 0; i < 8; i++) {
+        bool isChecked = (cfg.max_width == maxSizes[i].w && cfg.max_height == maxSizes[i].h);
+        UINT flags = MF_STRING | (isChecked ? MF_CHECKED : 0);
+        AppendMenuW(hMaxSize, flags, IDM_MAXSIZE_START + i, maxSizes[i].label);
+    }
+    AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hMaxSize), L"Max Size");
+
+    // Опция Aspect Fit
+    AppendMenuW(hMenu, MF_STRING | (cfg.aspect_fit ? MF_CHECKED : 0), IDM_ASPECT_FIT, L"Aspect Fit (Keep Ratio)");
 
     HMENU hOpacity = CreatePopupMenu();
     int ops[] = { 50, 125, 200, 255 };
@@ -475,6 +555,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (id == IDM_DOWNLOAD_NOW) {
             if (cfg.e621_enabled) DownloadInBackground();
         }
+        else if (id == IDM_ASPECT_FIT) {
+            cfg.aspect_fit = !cfg.aspect_fit;
+        }
         else if (id >= IDM_INTERVAL_START && id < IDM_INTERVAL_START + 6) {
             int intervals[] = { 30, 60, 300, 600, 1800, 3600 };
             cfg.download_interval = intervals[id - IDM_INTERVAL_START];
@@ -483,6 +566,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (id >= IDM_SCALE_START && id < IDM_SCALE_START + 6) {
             float scales[] = { 0.25f, 0.5f, 0.75f, 1.0f, 1.5f, 2.0f };
             cfg.scale = scales[id - IDM_SCALE_START];
+        }
+        else if (id >= IDM_MAXSIZE_START && id < IDM_MAXSIZE_START + 8) {
+            struct MaxSizeOption { int w; int h; };
+            MaxSizeOption maxSizes[] = {
+                {0, 0}, {640, 480}, {800, 600}, {1024, 768},
+                {1280, 720}, {1920, 1080}, {500, 500}, {300, 300}
+            };
+            int idx = id - IDM_MAXSIZE_START;
+            cfg.max_width = maxSizes[idx].w;
+            cfg.max_height = maxSizes[idx].h;
         }
         else if (id >= IDM_OPACITY_START && id < IDM_OPACITY_START + 4) {
             int ops[] = { 50, 125, 200, 255 };
@@ -526,9 +619,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     LoadConfig();
 
-    // Попытка загрузить начальное изображение из файла
     if (!LoadImageFromFile(L"image.png")) {
-        // Если нет файла - не критично, подождём скачивания
+        // Если нет файла - не критично
     }
 
     g_hIcon = static_cast<HICON>(LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON),

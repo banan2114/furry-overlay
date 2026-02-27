@@ -1,10 +1,13 @@
 {
+    "aspect_fit": true,
     "click_through": true,
     "download_interval": 30,
     "e621_enabled": true,
     "e621_tags": "rating:safe",
+    "max_height": 300,
+    "max_width": 300,
     "opacity": 255,
-    "scale": 0.25,
+    "scale": 1.0,
     "x": 14,
     "y": 11
 }
