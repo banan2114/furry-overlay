@@ -1,10 +1,10 @@
 {
-    "click_through": false,
+    "click_through": true,
     "download_interval": 30,
     "e621_enabled": true,
     "e621_tags": "rating:safe",
     "opacity": 255,
     "scale": 0.25,
-    "x": 1598,
-    "y": 48
+    "x": 14,
+    "y": 11
 }

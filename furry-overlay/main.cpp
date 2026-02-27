@@ -3,7 +3,6 @@
 #include <gdiplus.h>
 #include <shellapi.h>
 #include <wininet.h>
-#include <fstream>
 #include <string>
 #include <vector>
 #include <cmath>
@@ -11,7 +10,9 @@
 #include <iomanip>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <algorithm>
+#include <fstream>
 #include "json.hpp"
 
 #pragma comment(lib, "gdiplus.lib")
@@ -21,7 +22,6 @@
 using namespace Gdiplus;
 using json = nlohmann::json;
 
-// Идентификаторы
 #define WM_TRAYICON (WM_USER + 1)
 #define WM_DOWNLOAD_COMPLETE (WM_USER + 2)
 #define IDM_EXIT 1001
@@ -35,46 +35,46 @@ using json = nlohmann::json;
 #define HOTKEY_TOGGLE_CLICK 1
 #define HOTKEY_RELOAD 2
 #define TIMER_DOWNLOAD 1
-
-// ID иконки в ресурсах
 #define IDI_APPICON 101
 
-// Глобальные переменные
 ULONG_PTR gdiplusToken;
 HWND g_hwnd = nullptr;
 Image* g_image = nullptr;
 NOTIFYICONDATA nid = {};
 HICON g_hIcon = nullptr;
-std::wstring g_imagePath = L"image.png";
 std::atomic<bool> g_downloading(false);
+
+// Буфер для хранения изображения в памяти
+std::vector<BYTE> g_imageBuffer;
+std::mutex g_bufferMutex;
 
 struct Config {
     int x = 100, y = 100;
     float scale = 1.0f;
     int opacity = 255;
     bool click_through = true;
-
-    // E621 настройки
     bool e621_enabled = false;
     std::string e621_tags = "rating:safe";
-    int download_interval = 300; // секунды
+    int download_interval = 300;
 } cfg;
 
-// --- HTTP ФУНКЦИИ ---
+// --- HTTP: Скачивание в память ---
 
-std::string DownloadString(const std::string& url) {
-    std::string result;
-    HINTERNET hInternet = InternetOpenA("E621Downloader/1.0", INTERNET_OPEN_TYPE_DIRECT, nullptr, nullptr, 0);
+std::vector<BYTE> DownloadToMemory(const std::string& url) {
+    std::vector<BYTE> result;
+
+    HINTERNET hInternet = InternetOpenA("E621Downloader/1.0",
+        INTERNET_OPEN_TYPE_DIRECT, nullptr, nullptr, 0);
     if (!hInternet) return result;
 
     HINTERNET hConnect = InternetOpenUrlA(hInternet, url.c_str(), nullptr, 0,
         INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
 
     if (hConnect) {
-        char buffer[4096];
+        BYTE buffer[8192];
         DWORD bytesRead;
         while (InternetReadFile(hConnect, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
-            result.append(buffer, bytesRead);
+            result.insert(result.end(), buffer, buffer + bytesRead);
         }
         InternetCloseHandle(hConnect);
     }
@@ -83,50 +83,46 @@ std::string DownloadString(const std::string& url) {
     return result;
 }
 
-bool DownloadFile(const std::string& url, const std::wstring& filepath) {
-    HINTERNET hInternet = InternetOpenA("E621Downloader/1.0", INTERNET_OPEN_TYPE_DIRECT, nullptr, nullptr, 0);
-    if (!hInternet) return false;
-
-    HINTERNET hConnect = InternetOpenUrlA(hInternet, url.c_str(), nullptr, 0,
-        INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
-
-    if (!hConnect) {
-        InternetCloseHandle(hInternet);
-        return false;
-    }
-
-    std::ofstream file(filepath, std::ios::binary);
-    if (!file.is_open()) {
-        InternetCloseHandle(hConnect);
-        InternetCloseHandle(hInternet);
-        return false;
-    }
-
-    char buffer[4096];
-    DWORD bytesRead;
-    bool success = true;
-
-    while (InternetReadFile(hConnect, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
-        file.write(buffer, bytesRead);
-        if (file.fail()) {
-            success = false;
-            break;
-        }
-    }
-
-    file.close();
-
-    if (!success) {
-        DeleteFileW(filepath.c_str());
-    }
-
-    InternetCloseHandle(hConnect);
-    InternetCloseHandle(hInternet);
-
-    return success;
+std::string DownloadString(const std::string& url) {
+    auto data = DownloadToMemory(url);
+    return std::string(data.begin(), data.end());
 }
 
-// --- E621 ФУНКЦИИ ---
+// --- Создание Image из буфера в памяти ---
+
+Image* CreateImageFromMemory(const std::vector<BYTE>& buffer) {
+    if (buffer.empty()) return nullptr;
+
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, buffer.size());
+    if (!hMem) return nullptr;
+
+    void* pMem = GlobalLock(hMem);
+    if (!pMem) {
+        GlobalFree(hMem);
+        return nullptr;
+    }
+
+    memcpy(pMem, buffer.data(), buffer.size());
+    GlobalUnlock(hMem);
+
+    IStream* pStream = nullptr;
+    if (CreateStreamOnHGlobal(hMem, TRUE, &pStream) != S_OK) {
+        GlobalFree(hMem);
+        return nullptr;
+    }
+
+    Image* img = new Image(pStream);
+    pStream->Release();
+
+    if (!img || img->GetLastStatus() != Ok) {
+        delete img;
+        return nullptr;
+    }
+
+    return img;
+}
+
+// --- E621 ---
 
 std::string UrlEncode(const std::string& str) {
     std::ostringstream escaped;
@@ -146,32 +142,24 @@ std::string UrlEncode(const std::string& str) {
     return escaped.str();
 }
 
-bool DownloadRandomE621Image() {
+// Скачивает изображение с E621 напрямую в память
+bool DownloadRandomE621ImageToMemory(std::vector<BYTE>& outBuffer) {
     try {
-        // Формируем теги с использованием order:random и filetype:png
         std::string tags = cfg.e621_tags;
 
-        // Добавляем order:random для случайной выборки
         if (tags.find("order:") == std::string::npos) {
             tags += " order:random";
         }
-
-        // Добавляем filetype:png для загрузки только PNG изображений
         if (tags.find("filetype:") == std::string::npos && tags.find("type:") == std::string::npos) {
             tags += " filetype:png";
         }
 
-        // URL-кодируем теги
         std::string encodedTags = UrlEncode(tags);
-
-        // Формируем URL (limit=1 так как order:random уже даёт случайный результат)
         std::stringstream ss;
         ss << "https://e621.net/posts.json?tags=" << encodedTags << "&limit=1";
 
         std::string jsonData = DownloadString(ss.str());
-        if (jsonData.empty()) {
-            return false;
-        }
+        if (jsonData.empty()) return false;
 
         json response = json::parse(jsonData);
 
@@ -179,81 +167,42 @@ bool DownloadRandomE621Image() {
             return false;
         }
 
-        auto post = response["posts"][0];
-
-        // Проверка всех необходимых полей
-        if (!post.contains("file") || !post["file"].is_object()) {
-            return false;
-        }
+        auto& post = response["posts"][0];
+        if (!post.contains("file") || !post["file"].is_object()) return false;
 
         auto& file = post["file"];
-
-        if (!file.contains("url") || file["url"].is_null()) {
-            return false;
-        }
-
-        if (!file.contains("ext") || file["ext"].is_null()) {
-            return false;
-        }
+        if (!file.contains("url") || file["url"].is_null()) return false;
+        if (!file.contains("ext") || file["ext"].is_null()) return false;
 
         std::string imageUrl = file["url"].get<std::string>();
         std::string ext = file["ext"].get<std::string>();
 
-        if (imageUrl.empty()) {
-            return false;
-        }
+        if (imageUrl.empty()) return false;
+        if (ext != "png" && ext != "jpg" && ext != "jpeg") return false;
 
-        // Определяем расширение файла
-        std::wstring tempPath = L"e621_temp";
+        // Скачиваем изображение напрямую в память
+        outBuffer = DownloadToMemory(imageUrl);
+        return !outBuffer.empty();
 
-        if (ext == "png") {
-            tempPath += L".png";
-        }
-        else if (ext == "jpg" || ext == "jpeg") {
-            tempPath += L".jpg";
-        }
-        else {
-            // Если не PNG/JPG, пропускаем
-            return false;
-        }
-
-        // Скачиваем файл
-        if (DownloadFile(imageUrl, tempPath)) {
-            g_imagePath = tempPath;
-            return true;
-        }
-    }
-    catch (const json::exception&) {
-        // Ошибка парсинга JSON
-    }
-    catch (const std::exception&) {
-        // Другие исключения
     }
     catch (...) {
-        // Неизвестные исключения
+        return false;
     }
-
-    return false;
 }
 
-// --- ОСНОВНЫЕ ФУНКЦИИ ---
+// --- Конфиг ---
 
 void SaveConfig() {
     json j = {
-        {"x", cfg.x},
-        {"y", cfg.y},
-        {"scale", cfg.scale},
-        {"opacity", cfg.opacity},
+        {"x", cfg.x}, {"y", cfg.y},
+        {"scale", cfg.scale}, {"opacity", cfg.opacity},
         {"click_through", cfg.click_through},
         {"e621_enabled", cfg.e621_enabled},
         {"e621_tags", cfg.e621_tags},
         {"download_interval", cfg.download_interval}
     };
     std::ofstream f("config.json");
-    if (f.is_open()) {
-        f << j.dump(4);
-        f.close();
-    }
+    if (f.is_open()) { f << j.dump(4); f.close(); }
 }
 
 void LoadConfig() {
@@ -261,10 +210,7 @@ void LoadConfig() {
     if (!f.is_open()) return;
 
     try {
-        json j;
-        f >> j;
-        f.close();
-
+        json j; f >> j; f.close();
         cfg.x = j.value("x", 100);
         cfg.y = j.value("y", 100);
         cfg.scale = j.value("scale", 1.0f);
@@ -274,21 +220,14 @@ void LoadConfig() {
         cfg.e621_tags = j.value("e621_tags", "rating:safe");
         cfg.download_interval = j.value("download_interval", 300);
 
-        // Валидация значений
         cfg.x = std::clamp(cfg.x, -10000, 10000);
         cfg.y = std::clamp(cfg.y, -10000, 10000);
         cfg.scale = std::clamp(cfg.scale, 0.1f, 10.0f);
         cfg.opacity = std::clamp(cfg.opacity, 0, 255);
         cfg.download_interval = std::max(cfg.download_interval, 10);
-
-        // Проверка тегов
-        if (cfg.e621_tags.empty()) {
-            cfg.e621_tags = "rating:safe";
-        }
+        if (cfg.e621_tags.empty()) cfg.e621_tags = "rating:safe";
     }
-    catch (...) {
-        f.close();
-    }
+    catch (...) { f.close(); }
 }
 
 void ApplyClickThrough() {
@@ -301,8 +240,7 @@ void ApplyClickThrough() {
 }
 
 void UpdateOverlay() {
-    if (!g_hwnd) return;
-    if (!g_image || g_image->GetLastStatus() != Ok) return;
+    if (!g_hwnd || !g_image || g_image->GetLastStatus() != Ok) return;
 
     int w = static_cast<int>(g_image->GetWidth() * cfg.scale);
     int h = static_cast<int>(g_image->GetHeight() * cfg.scale);
@@ -312,10 +250,7 @@ void UpdateOverlay() {
     if (!screenDC) return;
 
     HDC memDC = CreateCompatibleDC(screenDC);
-    if (!memDC) {
-        ReleaseDC(nullptr, screenDC);
-        return;
-    }
+    if (!memDC) { ReleaseDC(nullptr, screenDC); return; }
 
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -356,21 +291,48 @@ void UpdateOverlay() {
     ReleaseDC(nullptr, screenDC);
 }
 
-bool LoadImage() {
-    if (g_image) {
-        delete g_image;
-        g_image = nullptr;
-    }
+// Загрузка изображения из внутреннего буфера
+bool LoadImageFromBuffer() {
+    std::lock_guard<std::mutex> lock(g_bufferMutex);
 
-    g_image = new Image(g_imagePath.c_str());
+    if (g_imageBuffer.empty()) return false;
 
-    if (!g_image || g_image->GetLastStatus() != Ok) {
-        if (g_image) {
-            delete g_image;
-            g_image = nullptr;
-        }
+    Image* newImage = CreateImageFromMemory(g_imageBuffer);
+    if (!newImage) return false;
+
+    if (g_image) delete g_image;
+    g_image = newImage;
+
+    return true;
+}
+
+// Загрузка изображения из файла (для начального запуска)
+bool LoadImageFromFile(const std::wstring& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) return false;
+
+    std::streamsize size = file.tellg();
+    if (size <= 0) { file.close(); return false; }
+
+    file.seekg(0, std::ios::beg);
+
+    std::vector<BYTE> buffer(static_cast<size_t>(size));
+    if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
+        file.close();
         return false;
     }
+    file.close();
+
+    Image* newImage = CreateImageFromMemory(buffer);
+    if (!newImage) return false;
+
+    if (g_image) delete g_image;
+    g_image = newImage;
+
+    // Сохраняем в глобальный буфер
+    std::lock_guard<std::mutex> lock(g_bufferMutex);
+    g_imageBuffer = std::move(buffer);
+
     return true;
 }
 
@@ -384,31 +346,31 @@ void StartDownloadTimer() {
 }
 
 void DownloadInBackground() {
-    // Проверяем, не идёт ли уже загрузка
-    if (g_downloading.exchange(true)) {
-        return;
-    }
+    if (g_downloading.exchange(true)) return;
 
     std::thread([]() {
-        bool success = DownloadRandomE621Image();
+        std::vector<BYTE> newBuffer;
+        bool success = DownloadRandomE621ImageToMemory(newBuffer);
+
+        if (success && !newBuffer.empty()) {
+            std::lock_guard<std::mutex> lock(g_bufferMutex);
+            g_imageBuffer = std::move(newBuffer);
+        }
+
         g_downloading = false;
 
         if (success && g_hwnd) {
-            PostMessage(g_hwnd, WM_DOWNLOAD_COMPLETE, success ? 1 : 0, 0);
+            PostMessage(g_hwnd, WM_DOWNLOAD_COMPLETE, 1, 0);
         }
         }).detach();
 }
 
-// --- МЕНЮ ТРЕЯ ---
-
 void ShowTrayMenu(HWND hWnd) {
     HMENU hMenu = CreatePopupMenu();
 
-    // E621 опции
     AppendMenuW(hMenu, MF_STRING | (cfg.e621_enabled ? MF_CHECKED : 0), IDM_ENABLE_E621, L"Enable E621 Auto-Download");
     AppendMenuW(hMenu, MF_STRING | (!cfg.e621_enabled ? MF_GRAYED : 0), IDM_DOWNLOAD_NOW, L"Download Now");
 
-    // Подменю: Интервал загрузки
     HMENU hInterval = CreatePopupMenu();
     int intervals[] = { 30, 60, 300, 600, 1800, 3600 };
     const wchar_t* intervalLabels[] = { L"30 sec", L"1 min", L"5 min", L"10 min", L"30 min", L"1 hour" };
@@ -417,10 +379,8 @@ void ShowTrayMenu(HWND hWnd) {
         AppendMenuW(hInterval, flags, IDM_INTERVAL_START + i, intervalLabels[i]);
     }
     AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hInterval), L"Download Interval");
-
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
-    // Подменю: Scale
     HMENU hScale = CreatePopupMenu();
     float scales[] = { 0.25f, 0.5f, 0.75f, 1.0f, 1.5f, 2.0f };
     for (int i = 0; i < 6; i++) {
@@ -430,7 +390,6 @@ void ShowTrayMenu(HWND hWnd) {
     }
     AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hScale), L"Scale");
 
-    // Подменю: Opacity
     HMENU hOpacity = CreatePopupMenu();
     int ops[] = { 50, 125, 200, 255 };
     const wchar_t* opLabels[] = { L"20%", L"50%", L"75%", L"100%" };
@@ -442,7 +401,7 @@ void ShowTrayMenu(HWND hWnd) {
 
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING | (cfg.click_through ? MF_CHECKED : 0), IDM_CLICKTHROUGH, L"Lock (Click-Through) \tAlt+T");
-    AppendMenuW(hMenu, MF_STRING, IDM_RELOAD, L"Reload Image && Config \tAlt+R");
+    AppendMenuW(hMenu, MF_STRING, IDM_RELOAD, L"Reload Config \tAlt+R");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Exit");
 
@@ -452,8 +411,6 @@ void ShowTrayMenu(HWND hWnd) {
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
     DestroyMenu(hMenu);
 }
-
-// --- ОБРАБОТКА ---
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -481,16 +438,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_DOWNLOAD_COMPLETE:
         if (wParam == 1) {
-            if (LoadImage()) {
+            if (LoadImageFromBuffer()) {
                 UpdateOverlay();
             }
         }
         break;
 
     case WM_TRAYICON:
-        if (lParam == WM_RBUTTONUP) {
-            ShowTrayMenu(hWnd);
-        }
+        if (lParam == WM_RBUTTONUP) ShowTrayMenu(hWnd);
         break;
 
     case WM_HOTKEY:
@@ -502,10 +457,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         else if (wParam == HOTKEY_RELOAD) {
             LoadConfig();
-            if (!LoadImage()) {
-                MessageBoxW(hWnd, L"Не удалось загрузить изображение", L"Ошибка", MB_ICONWARNING);
-            }
             ApplyClickThrough();
+            StartDownloadTimer();
             UpdateOverlay();
         }
         break;
@@ -513,19 +466,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_COMMAND: {
         int id = LOWORD(wParam);
 
-        if (id == IDM_EXIT) {
-            DestroyWindow(hWnd);
-            return 0;
-        }
+        if (id == IDM_EXIT) { DestroyWindow(hWnd); return 0; }
 
         if (id == IDM_ENABLE_E621) {
             cfg.e621_enabled = !cfg.e621_enabled;
             StartDownloadTimer();
         }
         else if (id == IDM_DOWNLOAD_NOW) {
-            if (cfg.e621_enabled) {
-                DownloadInBackground();
-            }
+            if (cfg.e621_enabled) DownloadInBackground();
         }
         else if (id >= IDM_INTERVAL_START && id < IDM_INTERVAL_START + 6) {
             int intervals[] = { 30, 60, 300, 600, 1800, 3600 };
@@ -546,10 +494,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         else if (id == IDM_RELOAD) {
             LoadConfig();
-            if (!LoadImage()) {
-                MessageBoxW(hWnd, L"Не удалось загрузить изображение", L"Ошибка", MB_ICONWARNING);
-            }
             ApplyClickThrough();
+            StartDownloadTimer();
         }
 
         SaveConfig();
@@ -574,29 +520,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     GdiplusStartupInput gsi;
     if (GdiplusStartup(&gdiplusToken, &gsi, nullptr) != Ok) {
-        MessageBoxW(nullptr, L"Не удалось инициализировать GDI+", L"Ошибка", MB_ICONERROR);
+        MessageBoxW(nullptr, L"GDI+ init failed", L"Error", MB_ICONERROR);
         return 1;
     }
 
     LoadConfig();
 
-    if (!LoadImage()) {
-        MessageBoxW(nullptr, L"Не удалось загрузить изображение", L"Предупреждение", MB_ICONWARNING);
+    // Попытка загрузить начальное изображение из файла
+    if (!LoadImageFromFile(L"image.png")) {
+        // Если нет файла - не критично, подождём скачивания
     }
 
-    // Используем LoadImage для получения private copy иконки
-    g_hIcon = static_cast<HICON>(LoadImageW(
-        hInst,
-        MAKEINTRESOURCEW(IDI_APPICON),
-        IMAGE_ICON,
-        0, 0,
-        LR_DEFAULTSIZE | LR_SHARED
-    ));
-
-    // Если иконка из ресурсов не загрузилась, используем стандартную
-    if (!g_hIcon) {
-        g_hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    }
+    g_hIcon = static_cast<HICON>(LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON),
+        IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED));
+    if (!g_hIcon) g_hIcon = LoadIcon(nullptr, IDI_APPLICATION);
 
     WNDCLASSW wc = {};
     wc.lpfnWndProc = WndProc;
@@ -606,28 +543,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     wc.hIcon = g_hIcon;
 
     if (!RegisterClassW(&wc)) {
-        MessageBoxW(nullptr, L"Не удалось зарегистрировать класс окна", L"Ошибка", MB_ICONERROR);
         delete g_image;
         GdiplusShutdown(gdiplusToken);
         return 1;
     }
 
     DWORD exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW;
-    if (cfg.click_through) {
-        exStyle |= WS_EX_TRANSPARENT;
-    }
+    if (cfg.click_through) exStyle |= WS_EX_TRANSPARENT;
 
-    g_hwnd = CreateWindowExW(
-        exStyle,
-        wc.lpszClassName,
-        L"Overlay",
-        WS_POPUP,
-        0, 0, 0, 0,
-        nullptr, nullptr, hInst, nullptr
-    );
+    g_hwnd = CreateWindowExW(exStyle, wc.lpszClassName, L"Overlay", WS_POPUP,
+        0, 0, 0, 0, nullptr, nullptr, hInst, nullptr);
 
     if (!g_hwnd) {
-        MessageBoxW(nullptr, L"Не удалось создать окно", L"Ошибка", MB_ICONERROR);
         delete g_image;
         GdiplusShutdown(gdiplusToken);
         return 1;
@@ -639,19 +566,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = g_hIcon;
-    wcscpy_s(nid.szTip, _countof(nid.szTip), L"E621 Overlay");
+    wcscpy_s(nid.szTip, L"E621 Overlay");
     Shell_NotifyIcon(NIM_ADD, &nid);
 
-    // Регистрация горячих клавиш с проверкой
-    if (!RegisterHotKey(g_hwnd, HOTKEY_TOGGLE_CLICK, MOD_ALT, 'T')) {
-        OutputDebugStringW(L"Warning: Failed to register Alt+T hotkey\n");
-    }
-    if (!RegisterHotKey(g_hwnd, HOTKEY_RELOAD, MOD_ALT, 'R')) {
-        OutputDebugStringW(L"Warning: Failed to register Alt+R hotkey\n");
-    }
+    RegisterHotKey(g_hwnd, HOTKEY_TOGGLE_CLICK, MOD_ALT, 'T');
+    RegisterHotKey(g_hwnd, HOTKEY_RELOAD, MOD_ALT, 'R');
 
     StartDownloadTimer();
-
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateOverlay();
 
@@ -661,14 +582,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         DispatchMessage(&msg);
     }
 
-    if (g_image) {
-        delete g_image;
-        g_image = nullptr;
-    }
-
-    // Не вызываем DestroyIcon для shared иконки (LR_SHARED)
-
+    delete g_image;
     GdiplusShutdown(gdiplusToken);
-
     return static_cast<int>(msg.wParam);
 }
