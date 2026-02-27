@@ -30,6 +30,7 @@ using json = nlohmann::json;
 #define IDM_ENABLE_E621 1004
 #define IDM_DOWNLOAD_NOW 1005
 #define IDM_ASPECT_FIT 1006
+#define IDM_OPEN_CONFIG 1007
 #define IDM_OPACITY_START 3000
 #define IDM_SCALE_START 4000
 #define IDM_INTERVAL_START 5000
@@ -58,38 +59,32 @@ struct Config {
     std::string e621_tags = "rating:safe";
     int download_interval = 300;
 
-    // Новые настройки
-    int max_width = 0;      // 0 = без ограничения
-    int max_height = 0;     // 0 = без ограничения
-    bool aspect_fit = true; // Сохранять пропорции при ограничении
+    int max_width = 0;
+    int max_height = 0;
+    bool aspect_fit = true;
 } cfg;
 
-// --- Вычисление финального размера с учётом ограничений ---
-
 void CalculateFinalSize(int originalW, int originalH, int& outW, int& outH) {
-    // Применяем scale
     float scaledW = originalW * cfg.scale;
     float scaledH = originalH * cfg.scale;
 
     outW = static_cast<int>(scaledW);
     outH = static_cast<int>(scaledH);
 
-    // Проверяем ограничения
     bool needClampW = (cfg.max_width > 0) && (outW > cfg.max_width);
     bool needClampH = (cfg.max_height > 0) && (outH > cfg.max_height);
 
     if (!needClampW && !needClampH) {
-        return; // Ограничения не нужны
+        return;
     }
 
     if (cfg.aspect_fit) {
-        // Aspect Fit: сохраняем пропорции, вписываем в ограничения
+        // Aspect Fit
         float ratioW = (cfg.max_width > 0) ?
             static_cast<float>(cfg.max_width) / scaledW : 1.0f;
         float ratioH = (cfg.max_height > 0) ?
             static_cast<float>(cfg.max_height) / scaledH : 1.0f;
 
-        // Берём минимальный коэффициент, чтобы вписаться в оба ограничения
         float ratio = std::min(ratioW, ratioH);
 
         if (ratio < 1.0f) {
@@ -98,7 +93,6 @@ void CalculateFinalSize(int originalW, int originalH, int& outW, int& outH) {
         }
     }
     else {
-        // Без сохранения пропорций: просто клампим каждую сторону
         if (needClampW) outW = cfg.max_width;
         if (needClampH) outH = cfg.max_height;
     }
@@ -422,6 +416,30 @@ void DownloadInBackground() {
         }).detach();
 }
 
+void OpenConfigInEditor() {
+    wchar_t fullPath[MAX_PATH];
+    DWORD len = GetFullPathNameW(L"config.json", MAX_PATH, fullPath, nullptr);
+
+    if (len == 0 || len >= MAX_PATH) {
+        ShellExecuteW(nullptr, L"open", L"notepad.exe", L"config.json", nullptr, SW_SHOW);
+        return;
+    }
+
+    std::ifstream checkFile("config.json");
+    if (!checkFile.is_open()) {
+        SaveConfig();
+    }
+    else {
+        checkFile.close();
+    }
+
+    HINSTANCE result = ShellExecuteW(nullptr, L"open", L"notepad.exe", fullPath, nullptr, SW_SHOW);
+
+    if (reinterpret_cast<INT_PTR>(result) <= 32) {
+        ShellExecuteW(nullptr, L"open", fullPath, nullptr, nullptr, SW_SHOW);
+    }
+}
+
 void ShowTrayMenu(HWND hWnd) {
     HMENU hMenu = CreatePopupMenu();
 
@@ -482,6 +500,7 @@ void ShowTrayMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING | (cfg.click_through ? MF_CHECKED : 0), IDM_CLICKTHROUGH, L"Lock (Click-Through) \tAlt+T");
     AppendMenuW(hMenu, MF_STRING, IDM_RELOAD, L"Reload Config \tAlt+R");
+    AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"Edit Config...");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Exit");
 
@@ -551,6 +570,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (id == IDM_ENABLE_E621) {
             cfg.e621_enabled = !cfg.e621_enabled;
             StartDownloadTimer();
+        }
+        else if (id == IDM_OPEN_CONFIG) {
+            OpenConfigInEditor();
+            return 0;
         }
         else if (id == IDM_DOWNLOAD_NOW) {
             if (cfg.e621_enabled) DownloadInBackground();
