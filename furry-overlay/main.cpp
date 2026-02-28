@@ -37,6 +37,7 @@ using json = nlohmann::json;
 #define IDM_MAXSIZE_START 6000
 #define HOTKEY_TOGGLE_CLICK 1
 #define HOTKEY_RELOAD 2
+#define HOTKEY_DOWNLOAD 3
 #define TIMER_DOWNLOAD 1
 #define IDI_APPICON 101
 
@@ -51,16 +52,16 @@ std::vector<BYTE> g_imageBuffer;
 std::mutex g_bufferMutex;
 
 struct Config {
-    int x = 100, y = 100;
+    int x = 5, y = 5;
     float scale = 1.0f;
     int opacity = 255;
     bool click_through = true;
-    bool e621_enabled = false;
+    bool e621_enabled = true;
     std::string e621_tags = "rating:safe";
-    int download_interval = 300;
+    int download_interval = 30;
 
-    int max_width = 0;
-    int max_height = 0;
+    int max_width = 500;
+    int max_height = 500;
     bool aspect_fit = true;
 } cfg;
 
@@ -79,7 +80,6 @@ void CalculateFinalSize(int originalW, int originalH, int& outW, int& outH) {
     }
 
     if (cfg.aspect_fit) {
-        // Aspect Fit
         float ratioW = (cfg.max_width > 0) ?
             static_cast<float>(cfg.max_width) / scaledW : 1.0f;
         float ratioH = (cfg.max_height > 0) ?
@@ -97,12 +97,9 @@ void CalculateFinalSize(int originalW, int originalH, int& outW, int& outH) {
         if (needClampH) outH = cfg.max_height;
     }
 
-    // Гарантируем минимальный размер
     outW = std::max(outW, 1);
     outH = std::max(outH, 1);
 }
-
-// --- HTTP: Скачивание в память ---
 
 std::vector<BYTE> DownloadToMemory(const std::string& url) {
     std::vector<BYTE> result;
@@ -131,8 +128,6 @@ std::string DownloadString(const std::string& url) {
     auto data = DownloadToMemory(url);
     return std::string(data.begin(), data.end());
 }
-
-// --- Создание Image из буфера в памяти ---
 
 Image* CreateImageFromMemory(const std::vector<BYTE>& buffer) {
     if (buffer.empty()) return nullptr;
@@ -165,8 +160,6 @@ Image* CreateImageFromMemory(const std::vector<BYTE>& buffer) {
 
     return img;
 }
-
-// --- E621 ---
 
 std::string UrlEncode(const std::string& str) {
     std::ostringstream escaped;
@@ -231,8 +224,6 @@ bool DownloadRandomE621ImageToMemory(std::vector<BYTE>& outBuffer) {
         return false;
     }
 }
-
-// --- Конфиг ---
 
 void SaveConfig() {
     json j = {
@@ -444,12 +435,12 @@ void ShowTrayMenu(HWND hWnd) {
     HMENU hMenu = CreatePopupMenu();
 
     AppendMenuW(hMenu, MF_STRING | (cfg.e621_enabled ? MF_CHECKED : 0), IDM_ENABLE_E621, L"Enable E621 Auto-Download");
-    AppendMenuW(hMenu, MF_STRING | (!cfg.e621_enabled ? MF_GRAYED : 0), IDM_DOWNLOAD_NOW, L"Download Now");
+    AppendMenuW(hMenu, MF_STRING, IDM_DOWNLOAD_NOW, L"Download Now \tAlt+N");
 
     HMENU hInterval = CreatePopupMenu();
-    int intervals[] = { 30, 60, 300, 600, 1800, 3600 };
-    const wchar_t* intervalLabels[] = { L"30 sec", L"1 min", L"5 min", L"10 min", L"30 min", L"1 hour" };
-    for (int i = 0; i < 6; i++) {
+    int intervals[] = { 30, 60, 300, 600 };
+    const wchar_t* intervalLabels[] = { L"30 sec", L"1 min", L"5 min", L"10 min" };
+    for (int i = 0; i < 4; i++) {
         UINT flags = MF_STRING | ((cfg.download_interval == intervals[i]) ? MF_CHECKED : 0);
         AppendMenuW(hInterval, flags, IDM_INTERVAL_START + i, intervalLabels[i]);
     }
@@ -465,7 +456,6 @@ void ShowTrayMenu(HWND hWnd) {
     }
     AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hScale), L"Scale");
 
-    // Подменю максимального размера
     HMENU hMaxSize = CreatePopupMenu();
     struct MaxSizeOption { int w; int h; const wchar_t* label; };
     MaxSizeOption maxSizes[] = {
@@ -485,7 +475,6 @@ void ShowTrayMenu(HWND hWnd) {
     }
     AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hMaxSize), L"Max Size");
 
-    // Опция Aspect Fit
     AppendMenuW(hMenu, MF_STRING | (cfg.aspect_fit ? MF_CHECKED : 0), IDM_ASPECT_FIT, L"Aspect Fit (Keep Ratio)");
 
     HMENU hOpacity = CreatePopupMenu();
@@ -560,6 +549,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             StartDownloadTimer();
             UpdateOverlay();
         }
+        else if (wParam == HOTKEY_DOWNLOAD) {
+            DownloadInBackground();
+        }
         break;
 
     case WM_COMMAND: {
@@ -576,13 +568,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         else if (id == IDM_DOWNLOAD_NOW) {
-            if (cfg.e621_enabled) DownloadInBackground();
+            DownloadInBackground();
         }
         else if (id == IDM_ASPECT_FIT) {
             cfg.aspect_fit = !cfg.aspect_fit;
         }
-        else if (id >= IDM_INTERVAL_START && id < IDM_INTERVAL_START + 6) {
-            int intervals[] = { 30, 60, 300, 600, 1800, 3600 };
+        else if (id >= IDM_INTERVAL_START && id < IDM_INTERVAL_START + 4) {
+            int intervals[] = { 30, 60, 300, 600 };
             cfg.download_interval = intervals[id - IDM_INTERVAL_START];
             StartDownloadTimer();
         }
@@ -623,6 +615,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         KillTimer(hWnd, TIMER_DOWNLOAD);
         UnregisterHotKey(hWnd, HOTKEY_TOGGLE_CLICK);
         UnregisterHotKey(hWnd, HOTKEY_RELOAD);
+        UnregisterHotKey(hWnd, HOTKEY_DOWNLOAD);
         Shell_NotifyIcon(NIM_DELETE, &nid);
         PostQuitMessage(0);
         break;
@@ -686,6 +679,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     RegisterHotKey(g_hwnd, HOTKEY_TOGGLE_CLICK, MOD_ALT, 'T');
     RegisterHotKey(g_hwnd, HOTKEY_RELOAD, MOD_ALT, 'R');
+    RegisterHotKey(g_hwnd, HOTKEY_DOWNLOAD, MOD_ALT, 'N');
 
     StartDownloadTimer();
     ShowWindow(g_hwnd, SW_SHOW);
